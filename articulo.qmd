@@ -1,0 +1,337 @@
+---
+title: "Evaluación empírica de sockets TCP de bajo nivel frente a gRPC en streaming unidireccional y bidireccional para telemetría de alta frecuencia"
+author:
+  - name: "Steven Alexis Chango Vela"
+    affiliations:
+      - name: "Sistemas Distribuidos y Paradigmas de la Computación"
+abstract: |
+  La telemetría de alta frecuencia exige transportar mensajes pequeños con
+  latencia acotada y bajo coste por mensaje. gRPC aporta contrato tipado y
+  streaming sobre HTTP/2, pero interpone serialización, framing y runtime entre
+  la aplicación y el socket. Este trabajo cuantifica ese coste frente a un
+  socket TCP con framing binario mínimo en cuatro escenarios (TCP y gRPC,
+  streaming unidireccional y bidireccional), con \KNruns{} ejecuciones, 30
+  réplicas por celda, payloads de 64 a 4096 B y ritmos de 100 a 1000 Hz. La
+  latencia de un solo sentido (OWD) se mide con un reloj monotónico compartido;
+  el RTT se reporta solo como RTT. Las 144 comparaciones principales fueron
+  significativas tras Holm. En unidireccional, gRPC incrementó la OWD p50 un
+  \KNDeltaMedianaUCZ{} % a 1024 B y 1000 Hz; en bidireccional el cambio en la
+  mediana fue \KNDeltaMedianaBCZ{} % y la cola p99 un \KNDeltaColaBCZ{} % mayor.
+  gRPC consumió más CPU y memoria por mensaje y su throughput fue un orden de
+  magnitud menor, aunque esa familia no alcanzó significancia tras Holm. El
+  coste reside en la pila de abstracción, no en los bytes de cabecera.
+keywords:
+  - telemetría
+  - TCP
+  - gRPC
+  - HTTP/2
+  - latencia de un solo sentido
+  - streaming
+format:
+  ieee-pdf:
+    include-in-header:
+      - .pdfcompat.tex
+      - analysis/key_numbers.tex
+---
+
+# Introducción
+
+La telemetría de alta frecuencia —adquisición de sensores, monitorización de
+infraestructura y control distribuido— transporta mensajes pequeños con
+requisitos estrictos de latencia y regularidad. La elección del transporte
+condiciona el coste por mensaje, la multiplexación y el contrato entre
+productor y consumidor. gRPC se ha consolidado en microservicios por su
+contrato tipado en Protocol Buffers y su streaming sobre HTTP/2
+[@grpc2024core]; HTTP/2 multiplexa streams sobre una conexión TCP y comprime
+cabeceras [@rfc9113]. Esas funciones se apoyan en serialización, framing,
+gestión de streams y runtime, capas cuyo coste debe cuantificarse frente a un
+socket directo.
+
+La literatura comparativa se centra en servicios web y en redes reales
+[@jackson2024streaming; @niswar2024performance; @dematos2021secure], de modo
+que mezcla el efecto del protocolo con el de la red, el proxy y la carga. Para
+decidir si la abstracción es aceptable en telemetría conviene aislar la pila,
+medir la latencia de un solo sentido y controlar el ritmo de envío.
+
+Este trabajo aporta: (i) un banco reproducible que mide OWD real —no RTT/2— con
+un reloj monotónico compartido, además de RTT, procesamiento, throughput, CPU y
+memoria; (ii) un diseño factorial con 30 réplicas por celda y procesos nuevos
+en cada ejecución; (iii) un análisis que separa significancia estadística de
+relevancia práctica mediante Mann--Whitney, Holm, $\delta$ de Cliff e
+intervalos bootstrap; y (iv) la documentación de los costes de serialización y
+framing. La hipótesis nula H0 es que, por celda (modalidad, payload, ritmo y
+concurrencia), la distribución de la métrica por ejecución es la misma en TCP
+y en gRPC; H1 es que difieren.
+
+# Trabajos relacionados
+
+Jackson et al. [@jackson2024streaming] comparan tecnologías de streaming y
+serialización y concluyen que la pila afecta de forma medible al rendimiento,
+aunque no aíslan la latencia de un solo sentido. Niswar et al.
+[@niswar2024performance] evalúan REST, GraphQL y gRPC en microservicios y
+observan ventajas de gRPC con mediciones de extremo a extremo sobre red.
+Kvancz y Forstner [@kvancz2024performance] destacan la eficiencia de
+serialización de gRPC y su dependencia del runtime; de Matos et al.
+[@dematos2021secure] muestran el peso del entorno móvil en el offloading con
+gRPC. Oda y Yamaguchi [@oda2018http2] evidencian que la multiplexación de
+HTTP/2 cambia el comportamiento frente a HTTP/1.1, y las especificaciones de
+HTTP/2 [@rfc9113] y TCP [@rfc9293] definen el framing que condiciona los
+costes. Ninguno compara, con reloj compartido y en la misma máquina, un framing
+binario mínimo sobre TCP frente a gRPC en sus dos modalidades de streaming.
+
+# Metodología experimental
+
+## Escenarios y framing
+
+Se implementaron cuatro escenarios: TCP unidireccional (T-U), TCP
+bidireccional (T-B), gRPC unidireccional (G-U) y gRPC bidireccional (G-B). En
+unidireccional el cliente envía y el servidor solo recibe; en bidireccional el
+servidor devuelve un acuse por mensaje. Todos usan una conexión física y
+multiplexan $C$ flujos lógicos: en TCP el identificador viaja en los 16 bits
+altos de la secuencia y el servidor mantiene estado por flujo; en gRPC cada
+flujo es un stream del mismo canal.
+
+El framing TCP es un prefijo de longitud de 4 B en orden de red, `!QQ`
+(secuencia y marca de envío) y el payload: 20 B de cabecera, con `TCP_NODELAY`
+y una escritura por mensaje. El contrato gRPC usa Protocol Buffers con los
+mismos campos y compresión deshabilitada. El sobre reportado compara cabeceras
+de aplicación —20 B en TCP frente a 5 B de prefijo más protobuf— y excluye
+HTTP/2 y TCP/IP. Cliente y servidor son procesos nuevos por ejecución,
+fijados a núcleos distintos (servidor en 0--1, cliente en 2--3); el
+orquestador lanza el servidor, espera su evento de listo, lanza el cliente y
+empareja los mensajes por secuencia.
+
+## Métricas y sincronización
+
+La métrica principal es la OWD, diferencia entre la marca de recepción y la de
+envío con `time.perf_counter_ns()`. Al compartir host, ambas usan el mismo
+reloj monotónico: es una medición directa, no una estimación desde el RTT. El
+RTT se calcula solo en bidireccional y se reporta como RTT, sin dividirlo por
+dos; el procesamiento del servidor se registra aparte. Por ejecución se
+reportan p50, p90, p95 y p99, media, desviación típica, mínimo, máximo y
+jitter, además de throughput, CPU por mensaje (`psutil`) y memoria residente.
+El emisor usa fechas límite absolutas ($t_0 + i/f$) y registra la lateness; con
+`spin_us = 0` se evita contaminar la CPU y el ritmo alcanzado se compara con el
+nominal.
+
+## Configuración del benchmark
+
+La matriz principal cruza 4 escenarios, 4 payloads (64, 256, 1024 y 4096 B) y
+3 ritmos (100, 500 y 1000 Hz) con $C=1$ y 30 réplicas: 1440 ejecuciones. Un
+bloque mide la multiplexación con $C \in \{4, 16\}$ a 1024 B y 500 Hz (240
+ejecuciones) y otro, sin ritmo impuesto, mide throughput durante 5 s con 5
+réplicas por payload (80 ejecuciones); en total, \KNruns{} ejecuciones. Cada
+una mide 2000 mensajes tras un calentamiento de al menos 500 mensajes o 2 s.
+El orden de celdas se aleatoriza para repartir la deriva térmica. El entorno es
+un host con \KNcores{} núcleos físicos y \KNthreads{} hilos (\KNcpuModel),
+\KNosBuild, Python \KNpy{} y gRPC \KNgrpc. Medir en un solo host elimina el
+tránsito por red, de modo que los resultados caracterizan la pila pero no
+incluyen propagación, pérdida ni congestión.
+
+## Procedimiento estadístico
+
+La unidad de análisis es la ejecución, no el mensaje: los 2000 mensajes
+comparten proceso, conexión y carga, y tratarlos como independientes inflaría
+la significancia. Por celda se comparan 30 réplicas de TCP con 30 de gRPC
+mediante Mann--Whitney bilateral, adecuada porque las latencias son acotadas,
+asimétricas y de colas pesadas; con $n=30$ la aproximación normal es válida y
+la prueba es robusta a extremos. El error de tipo I se controla por familia de
+métricas con Holm--Bonferroni. El tamaño del efecto se mide con $\delta$ de
+Cliff, en $[-1, 1]$, y la incertidumbre de la diferencia de medianas con un
+bootstrap de 4000 remuestreos. Una diferencia es prácticamente relevante si es
+significativa tras Holm y el cambio relativo de medianas alcanza el 10 %.
+
+# Resultados
+
+## Integridad de los datos
+
+Se analizaron \KNruns{} ejecuciones válidas (\KNcells{} celdas), sin pérdidas
+(\KNlossRuns{}) ni mensajes sin emparejar (\KNjoinMissing). Una ejecución
+alcanzó 491.75 msg/s frente a 500 Hz nominales (déficit del 1.65 %); se
+conservó porque no hubo pérdida y la unidad de análisis es la ejecución. La
+lateness p99 superó un periodo en \KNlatenessPeriod{} ejecuciones, indicador de
+agrupación de envíos por la granularidad del temporizador de Windows. Se
+conservaron \KNoutliers{} valores atípicos robustos (más de seis desviaciones
+absolutas medianas respecto de la mediana de su celda), dado que el análisis
+usa medianas y rangos.
+
+## Latencia de un solo sentido
+
+La Fig. \ref{fig-latency} muestra la mediana de la OWD p50 por payload y
+ritmo, con cuartiles entre réplicas. En lo sucesivo, $\Delta$ denota el cambio
+relativo $(\text{gRPC} - \text{TCP})/\text{TCP}$. A 1024 B y 1000 Hz la OWD p50
+pasó de \KNpFiftyTUCZ{} a \KNpFiftyGUCZ{} $\mu$s en unidireccional ($\Delta$ =
+\KNDeltaMedianaUCZ{} %) y de \KNpFiftyTBCZ{} a \KNpFiftyGBCZ{} $\mu$s en
+bidireccional ($\Delta$ = \KNDeltaMedianaBCZ{} %). En la cola p99, pasó de
+\KNpNinetyNineTUCZ{} a \KNpNinetyNineGUCZ{} $\mu$s ($\Delta$ =
+\KNDeltaColaUCZ{} %) y de \KNpNinetyNineTBCZ{} a \KNpNinetyNineGBCZ{} $\mu$s
+($\Delta$ = \KNDeltaColaBCZ{} %).
+
+```{=latex}
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=0.96\textwidth]{figures/fig01_latency_p50.pdf}
+\caption{Mediana de la OWD p50 por tamaño de payload y ritmo, con rango
+intercuartílico entre las 30 réplicas (C=1). Arriba: streaming unidireccional;
+abajo: bidireccional. Azul: TCP; naranja: gRPC.}
+\label{fig-latency}
+\end{figure*}
+```
+
+De las \KNtestsLatMediana{} comparaciones de OWD p50, \KNsigLatMediana{}
+resultaron significativas tras Holm y \KNpracticalLatMediana{} superaron el
+umbral del 10 %; para p99, \KNsigLatCola{} de \KNtestsLatCola{} fueron
+significativas y \KNpracticalLatCola{} prácticamente relevantes. La mediana de
+las 24 comparaciones fue +57.9 % en p50 y +87.1 % en p99, pero ese agregado
+oculta un patrón: en bidireccional a 1000 Hz el signo se invierte y gRPC
+presenta menor p50 en los cuatro payloads ($\Delta$ entre $-$27.9 % y
+$-$32.9 %, $\delta$ de Cliff entre 0.64 y 0.75), mientras su p99 es entre
+38.6 % y 60.2 % mayor (Tabla \ref{tab:tests}). En el resto de celdas gRPC
+tiene mayor p50. La ventaja bidireccional es de mediana y no de cola, y solo
+aparece a 1000 Hz.
+
+```{=latex}
+\input{tables/table_tests_p50.tex}
+```
+
+## RTT en streaming bidireccional
+
+El RTT incluye envío, procesamiento, acuse y recepción; es una cota superior
+con dos trayectos y no se interpreta como OWD. A 1024 B y 1000 Hz, el RTT p50
+fue de \KNrttTBCZ{} $\mu$s en T-B y \KNrttGBCZ{} $\mu$s en G-B; el p99 fue de
+648.6 y 895.7 $\mu$s. La diferencia entre la OWD de ida y el RTT de la misma
+celda separa el coste del acuse, que aquí incluye el procesamiento del servidor
+y el trayecto de vuelta.
+
+## Throughput
+
+La Tabla \ref{tab:throughput} recoge el régimen no limitado. El máximo fue de
+\KNthrMaxTU{} msg/s en T-U, \KNthrMaxTB{} en T-B, \KNthrMaxGU{} en G-U y
+\KNthrMaxGB{} en G-B; con 4096 B se alcanzaron \KNthrMaxMbpsTU{},
+\KNthrMaxMbpsTB{}, \KNthrMaxMbpsGU{} y \KNthrMaxMbpsGB{} Mbit/s. La diferencia
+es de aproximadamente un orden de magnitud (89--94 % menos en gRPC), pero
+ninguna de las \KNtestsThroughputThrMsg{} comparaciones alcanzó significancia
+tras Holm (\KNsigThroughputThrMsg{} significativas). El efecto no es pequeño:
+con 5 réplicas, el p bilateral mínimo de Mann--Whitney es 0.0079 y Holm sobre 8
+contrastes lo eleva a 0.063, de modo que esa familia no puede rechazar H0 con
+el diseño actual. Se reporta como evidencia descriptiva de un efecto grande, no
+como confirmación.
+
+```{=latex}
+\input{tables/table_throughput.tex}
+```
+
+## CPU, memoria y multiplexación
+
+La Tabla \ref{tab:resources} recoge CPU y memoria. El cliente de G-B consumió
+\KNcpuCliGB{} $\mu$s por mensaje frente a \KNcpuCliTB{} $\mu$s de T-B, y el
+servidor \KNcpuSrvGB{} frente a \KNcpuSrvTB{} $\mu$s; en unidireccional, el
+cliente pasó de \KNcpuCliTU{} a \KNcpuCliGU{} $\mu$s y el servidor de
+\KNcpuSrvTU{} a \KNcpuSrvGU{} $\mu$s. Las 24 comparaciones de CPU fueron
+significativas y prácticamente relevantes (mediana de +71.5 % en cliente y
++93.9 % en servidor). La memoria residente mediana fue de \KNrssCliGB{} MB en
+G-B frente a \KNrssCliTB{} MB en T-B, y de \KNrssCliGU{} frente a \KNrssCliTU{}
+MB en unidireccional; las 24 comparaciones de RSS también fueron significativas,
+con incrementos en torno al 30 %. El experimento no descompone esa memoria
+entre runtime, búferes y estructuras de HTTP/2.
+
+```{=latex}
+\input{tables/table_resources.tex}
+```
+
+La multiplexación añade colas por flujo y, en gRPC, gestión de streams. A
+1024 B y 500 Hz, con $C=4$ la OWD p50 fue de \KNscalTUFour{} $\mu$s en T-U y
+\KNscalGUFour{} $\mu$s en G-U ($\Delta$ = \KNDeltaScalingUFour{} %); con $C=16$
+pasó a \KNscalTUSixteen{} y \KNscalGUSixteen{} $\mu$s ($\Delta$ =
+\KNDeltaScalingUSixteen{} %). En bidireccional, T-B pasó de \KNscalTBFour{} a
+\KNscalTBSixteen{} $\mu$s y G-B de \KNscalGBFour{} a \KNscalGBSixteen{} $\mu$s
+($\Delta$ = \KNDeltaScalingBFour{} % con $C=4$ y \KNDeltaScalingBSixteen{} %
+con $C=16$). Las \KNtestsScalingLatMediana{} comparaciones fueron
+significativas. El coste relativo no es monótono: con $C=16$ en unidireccional
+TCP sube a \KNscalTUSixteen{} $\mu$s y la brecha porcentual se reduce, aunque
+gRPC sigue siendo más lento en términos absolutos.
+
+# Discusión técnica
+
+El coste se descompone en serialización, comunicación y abstracción. La
+serialización convierte el mensaje en bytes: protobuf usa varints y campos de
+longitud, mientras el framing TCP usa campos fijos de 8 B. La comunicación es
+el sobre por mensaje: 20 B en TCP frente a 18 B en gRPC a 1024 B. La
+abstracción es el trabajo del runtime —streams, bombas asíncronas, conversión
+de tipos— y se refleja en CPU y memoria.
+
+La CPU es la evidencia más directa del coste de abstracción: gRPC consumió más
+CPU en las 144 comparaciones principales y usó más memoria. El sobre de
+aplicación fue, en cambio, menor en gRPC, de modo que la penalización no
+proviene de los bytes de cabecera sino de la pila que los procesa. Es
+coherente con el throughput: si el coste por mensaje se duplica y el
+rendimiento cae un orden de magnitud, el cuello de botella está en el
+procesamiento y no en el ancho de banda, irrelevante a estos payloads.
+
+La inversión de signo en bidireccional a 1000 Hz exige cautela. Una explicación
+plausible es la coalescencia: cuando el emisor acumula lateness —la lateness
+p50 a 1000 Hz es de 525 $\mu$s, medio periodo—, varios mensajes pueden
+agruparse y repartir el coste fijo de la llamada, lo que reduce la mediana pero
+concentra la cola. No se registraron tamaños de segmento ni llamadas al
+sistema, así que es una hipótesis. Lo que sostienen los datos es que la ventaja
+no se extiende al p99 y no aparece a 100 o 500 Hz.
+
+Para telemetría, la elección depende del recurso crítico. Si dominan CPU y
+regularidad, el socket directo tiene ventaja. Si dominan el contrato, la
+interoperabilidad y la multiplexación, gRPC compensa su coste con funcionalidad
+resuelta, siempre que se presupuesten CPU y memoria. Las diferencias de latencia
+(0.1--0.8 ms) corresponden a un mismo host; en una red de área amplia la
+propagación puede dominar y el orden relativo podría cambiar.
+
+# Amenazas a la validez
+
+*Validez interna.* Cliente y servidor comparten host: la OWD no incluye
+propagación, pérdida ni congestión. Los temporizadores de Windows tienen
+granularidad limitada; sin espera activa el emisor agrupa envíos y la lateness
+p99 supera un periodo en \KNlatenessPeriod{} ejecuciones sin pérdida. No se
+controló la frecuencia ni la energía de la CPU: la OWD disminuye al aumentar el
+ritmo en todos los escenarios (G-B, 1024 B, pasa de \KNpFiftyGBCX{} a \KNpFiftyGBCZ{} $\mu$s entre 100 y
+1000 Hz), un patrón que no puede separarse del despertar del temporizador. La
+contabilidad de CPU es cuantizada (15.625 ms, unos 7.8 $\mu$s por mensaje) e
+incluye el overhead del proceso acumulado durante la ejecución.
+
+*Validez externa.* Un solo host, una implementación en Python, cuatro payloads
+y tres ritmos: los resultados no se extrapolan sin verificación a redes de área
+amplia, otros lenguajes o mensajes grandes. El contrato protobuf y el framing
+TCP son equivalentes en campos, pero no agotan compresión, TLS, keepalive o
+proxies.
+
+*Validez de constructo.* La OWD se mide en la aplicación, no en la interfaz de
+red: incluye lectura del socket y desempaquetado, que forma parte del coste
+percibido pero no del transporte puro. El sobre compara cabeceras de aplicación,
+no el total de bytes en el medio. El RTT solo existe en bidireccional y no
+sustituye a la OWD.
+
+*Validez estadística.* Se aplican 24 contrastes por familia principal con Holm;
+la potencia es limitada para efectos pequeños, de modo que un resultado no
+significativo no prueba equivalencia. La familia de throughput tiene 5 réplicas
+y 8 contrastes, con un p mínimo ajustado de 0.063. Los 362 atípicos se
+conservaron; el uso de medianas, rangos y $\delta$ de Cliff reduce su influencia,
+pero no la elimina.
+
+# Conclusiones
+
+Se compararon sockets TCP y gRPC en streaming unidireccional y bidireccional con
+un banco reproducible, reloj compartido y 30 réplicas por celda. En
+unidireccional, gRPC incrementó la OWD p50 un \KNDeltaMedianaUCZ{} % y la p99 un
+\KNDeltaColaUCZ{} % a 1024 B y 1000 Hz. En bidireccional el patrón fue
+asimétrico: la mediana favoreció a gRPC (\KNDeltaMedianaBCZ{} %) mientras la cola
+p99 empeoró un \KNDeltaColaBCZ{} %, y la inversión solo apareció a 1000 Hz. gRPC
+consumió más CPU por mensaje (+71.5 % en cliente y +93.9 % en servidor) y más
+memoria, y su throughput fue un orden de magnitud menor, aunque esa familia no
+alcanzó significancia por falta de potencia. El sobre de aplicación de gRPC fue
+menor que el del framing TCP, lo que sitúa el coste en la pila de abstracción y
+no en los bytes de cabecera. La decisión práctica depende del recurso limitante:
+TCP directo cuando dominan CPU y regularidad; gRPC cuando dominan contrato,
+interoperabilidad y multiplexación, con presupuesto explícito de CPU y memoria.
+Como trabajo futuro se plantea repetir el experimento con red real, TLS,
+compresión y otros lenguajes.
+
+```{=latex}
+\section*{Referencias}
+```

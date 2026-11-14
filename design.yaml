@@ -1,0 +1,99 @@
+# Matriz experimental congelada del benchmark TCP vs gRPC.
+#
+# Una celda = (escenario, payload, ritmo, concurrencia). Cada celda se repite
+# `replicas` veces con procesos nuevos. El perfil `smoke` sirve para validar el
+# arnés de medición y NO produce resultados publicables.
+
+meta:
+  project: sdpc-tcp-vs-grpc
+  seed: 20261114
+  # "shuffled" reparte los efectos de deriva térmica entre celdas; el orden
+  # efectivo queda registrado en la columna order_index de results.csv.
+  order: shuffled
+  # Giro activo al final de cada espera de planificación. Se deja en 0 para no
+  # contaminar cpu_*_us_msg; el error de planificación se reporta como lateness.
+  spin_us: 0
+
+platform:
+  affinity:
+    enabled: true
+    server: [0, 1]
+    client: [2, 3]
+
+profiles:
+
+  # ---------------------------------------------------------------------------
+  # Perfil de validación: cargas mínimas, sin valor estadístico.
+  # ---------------------------------------------------------------------------
+  smoke:
+    scenarios: ["T-U", "T-B", "G-U", "G-B"]
+    modes:
+      - name: smoke-main
+        kind: paced
+        concurrency: [1]
+        payload_bytes: [64, 1024]
+        rates_hz: [100, 500, 1000]
+        messages: 100
+        warmup_msgs_min: 20
+        warmup_s: 0.1
+        replicas: 1
+        record_raw: true
+
+      - name: smoke-concurrent
+        kind: paced
+        concurrency: [4]
+        payload_bytes: [256]
+        rates_hz: [200]
+        messages: 120
+        warmup_msgs_min: 24
+        warmup_s: 0.1
+        replicas: 1
+        record_raw: true
+
+      - name: smoke-throughput
+        kind: unpaced
+        concurrency: [1]
+        payload_bytes: [64]
+        duration_s: 1.0
+        replicas: 1
+        record_raw: false
+
+  # ---------------------------------------------------------------------------
+  # Perfil principal del artículo.
+  #   main:       4 escenarios x 4 payload x 3 ritmos x 1 flujo x 30 reps = 1440
+  #   scaling:    4 escenarios x 1 payload x 1 ritmo x 2 conc  x 30 reps =  240
+  #   throughput: 4 escenarios x 4 payload x 1 flujo x 5 reps             =   80
+  #                                                                  total = 1760
+  # ---------------------------------------------------------------------------
+  design:
+    scenarios: ["T-U", "T-B", "G-U", "G-B"]
+    modes:
+      - name: main
+        kind: paced
+        concurrency: [1]
+        payload_bytes: [64, 256, 1024, 4096]
+        rates_hz: [100, 500, 1000]
+        messages: 2000
+        warmup_msgs_min: 500
+        warmup_s: 2.0
+        replicas: 30
+        record_raw: true
+
+      - name: scaling
+        kind: paced
+        concurrency: [4, 16]
+        payload_bytes: [1024]
+        rates_hz: [500]
+        messages: 2000
+        warmup_msgs_min: 500
+        warmup_s: 2.0
+        replicas: 30
+        record_raw: true
+
+      - name: throughput
+        kind: unpaced
+        concurrency: [1]
+        payload_bytes: [64, 256, 1024, 4096]
+        duration_s: 5.0
+        replicas: 5
+        record_raw: false

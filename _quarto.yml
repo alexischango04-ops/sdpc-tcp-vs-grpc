@@ -1,0 +1,13 @@
+project:
+  type: default
+  render:
+    - articulo.qmd
+    - verificacion-plantilla-ieee.qmd
+
+format:
+  ieee-pdf:
+    keep-tex: true
+
+bibliography: references.bib
+lang: es
+journaltype: conference
